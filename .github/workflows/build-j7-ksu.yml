@@ -71,6 +71,14 @@ jobs:
           set -eo pipefail
           curl -LSs "https://raw.githubusercontent.com/MrShockWAVEog/KernelSU/shockwave/kernel/setup.sh" | bash -s shockwave
 
+      - name: Patch KSU for old kernel
+        if: ${{ inputs.ksu }}
+        run: |
+          sed -i -e '/^#define strncpy(\.\.\.) static_assert/d' \
+                 -e 's|^#define strlcpy(\.\.\.) static_assert.*|#ifndef strscpy\n#define strscpy(d, s, n) strlcpy(d, s, n)\n#endif|' \
+                 KernelSU/kernel/kernel_includes.h
+          sed -n 490,505p KernelSU/kernel/kernel_includes.h
+
       - name: Generate config
         env:
           DEFCONFIG: ${{ inputs.defconfig }}
