@@ -1,0 +1,151 @@
+name: Build Samsung J7 Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig name"
+        required: true
+        default: "lineageos_a3xelte-octa_defconfig"
+      ksu:
+        description: "Add KernelSU? (yes = tick)"
+        type: boolean
+        required: true
+        default: false
+      force_disable:
+        description: "Configs to force OFF, space separated, without CONFIG_ (e.g. KSU_SUSFS FOO_BAR)"
+        required: false
+        default: "KSU_SUSFS"
+      arch:
+        description: "ARCH"
+        required: true
+        default: "arm64"
+      toolchain_repo:
+        description: "GCC 4.9 toolchain repo"
+        required: true
+        default: "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9"
+      cross_prefix:
+        description: "CROSS_COMPILE prefix"
+        required: true
+        default: "aarch64-linux-android-"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev make gcc-9 g++-9 \
+            git zip cpio xz-utils python3 device-tree-compiler curl
+
+      - name: Clone toolchain and set env
+        run: |
+          git clone --depth=1 "${{ inputs.toolchain_repo }}" "${{ runner.temp }}/toolchain"
+          {
+            echo "ARCH=${{ inputs.arch }}"
+            echo "SUBARCH=${{ inputs.arch }}"
+            echo "CROSS_COMPILE=${{ runner.temp }}/toolchain/bin/${{ inputs.cross_prefix }}"
+            echo "HOSTCC=gcc-9"
+            echo "HOSTCXX=g++-9"
+            echo "KBUILD_BUILD_USER=github"
+            echo "KBUILD_BUILD_HOST=actions"
+          } >> "$GITHUB_ENV"
+
+      - name: Patch for modern host GCC
+        run: |
+          sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/' scripts/dtc/dtc-lexer.lex.c_shipped 2>/dev/null || true
+          [ -f include/linux/compiler-gcc9.h ] || cp include/linux/compiler-gcc5.h include/linux/compiler-gcc9.h 2>/dev/null || true
+          [ -f include/linux/compiler-gcc11.h ] || cp include/linux/compiler-gcc5.h include/linux/compiler-gcc11.h 2>/dev/null || true
+
+      - name: Add KernelSU
+        if: ${{ inputs.ksu }}
+        run: |
+          set -eo pipefail
+          curl -LSs "https://raw.githubusercontent.com/MrShockWAVEog/KernelSU/shockwave/kernel/setup.sh" | bash -s shockwave
+
+      - name: Generate config
+        env:
+          DEFCONFIG: ${{ inputs.defconfig }}
+          KSU: ${{ inputs.ksu }}
+          FORCE_DISABLE: ${{ inputs.force_disable }}
+        run: |
+          set -eo pipefail
+          mkdir -p out
+          make O=out "$DEFCONFIG"
+          cp out/.config out/.config.base
+
+          setcfg() {  # $1=NAME (no CONFIG_)  $2=y|n
+            sed -i "/^CONFIG_$1=/d;/^# CONFIG_$1 is not set/d" out/.config
+            if [ "$2" = y ]; then echo "CONFIG_$1=y" >> out/.config
+            else echo "# CONFIG_$1 is not set" >> out/.config; fi
+          }
+
+          if [ "$KSU" = "true" ]; then
+            setcfg KSU y
+            setcfg KSU_TAMPER_SYSCALL_TABLE y
+          fi
+
+          # explicit "is not set" lines are respected by olddefconfig,
+          # so Kconfig "default y" symbols stay OFF
+          for c in $FORCE_DISABLE; do
+            setcfg "${c#CONFIG_}" n
+          done
+
+          make O=out olddefconfig
+
+          echo "=== Newly enabled/changed vs base defconfig (find unwanted default-y here) ==="
+          comm -13 <(grep -E '^CONFIG_.*=' out/.config.base | sort) \
+                   <(grep -E '^CONFIG_.*=' out/.config | sort) || true
+
+          # verify
+          for c in $FORCE_DISABLE; do
+            c="${c#CONFIG_}"
+            if grep -q "^CONFIG_$c=" out/.config; then
+              echo "::warning::$c is still enabled (probably 'select' or a dependency forces it)"
+            fi
+          done
+          if [ "$KSU" = "true" ]; then
+            grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::CONFIG_KSU not enabled"; exit 1; }
+            grep -q '^CONFIG_KSU_TAMPER_SYSCALL_TABLE=y' out/.config || echo "::warning::KSU_TAMPER_SYSCALL_TABLE not enabled (missing in this KSU fork or dependency)"
+          fi
+
+          # regenerate defconfig (keeps "# CONFIG_X is not set" for forced-off default-y symbols)
+          make O=out savedefconfig
+          cp out/defconfig out/defconfig.regenerated
+          # savedefconfig drops "is not set" lines of default-n symbols; add forced-off ones back
+          for c in $FORCE_DISABLE; do
+            c="${c#CONFIG_}"
+            grep -q "^# CONFIG_$c is not set" out/defconfig.regenerated || echo "# CONFIG_$c is not set" >> out/defconfig.regenerated
+          done
+
+      - name: Build
+        run: |
+          set -eo pipefail
+          make O=out -j"$(nproc)" 2>&1 | tee build.log
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          mkdir -p artifacts
+          cp out/.config artifacts/config 2>/dev/null || true
+          cp out/defconfig.regenerated artifacts/ 2>/dev/null || true
+          cp build.log artifacts/ 2>/dev/null || true
+          cp out/arch/*/boot/Image* artifacts/ 2>/dev/null || true
+          cp out/arch/*/boot/zImage* artifacts/ 2>/dev/null || true
+          find out/arch -name '*.dtb' -exec cp {} artifacts/ \; 2>/dev/null || true
+          ls -lh artifacts
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ github.run_number }}
+          path: artifacts/
