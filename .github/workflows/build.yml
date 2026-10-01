@@ -1,0 +1,82 @@
+name: Build Samsung J7 Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig name"
+        required: true
+        default: "lineageos_a3xelte-octa_defconfig"
+      arch:
+        description: "ARCH"
+        required: true
+        default: "arm64"
+      toolchain_repo:
+        description: "GCC 4.9 toolchain repo"
+        required: true
+        default: "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9"
+      cross_prefix:
+        description: "CROSS_COMPILE prefix"
+        required: true
+        default: "aarch64-linux-android-"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev make gcc-9 g++-9 \
+            git zip cpio xz-utils python3 device-tree-compiler
+
+      - name: Clone toolchain
+        run: git clone --depth=1 "${{ inputs.toolchain_repo }}" "${{ runner.temp }}/toolchain"
+
+      - name: Patch for modern host GCC
+        run: |
+          # old dtc: "multiple definition of yylloc"
+          sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/' scripts/dtc/dtc-lexer.lex.c_shipped 2>/dev/null || true
+          # old kernels reject newer compiler headers
+          [ -f include/linux/compiler-gcc9.h ] || cp include/linux/compiler-gcc5.h include/linux/compiler-gcc9.h 2>/dev/null || true
+          [ -f include/linux/compiler-gcc11.h ] || cp include/linux/compiler-gcc5.h include/linux/compiler-gcc11.h 2>/dev/null || true
+
+      - name: Build
+        env:
+          ARCH: ${{ inputs.arch }}
+          SUBARCH: ${{ inputs.arch }}
+          CROSS_COMPILE: ${{ runner.temp }}/toolchain/bin/${{ inputs.cross_prefix }}
+          HOSTCC: gcc-9
+          HOSTCXX: g++-9
+          KBUILD_BUILD_USER: github
+          KBUILD_BUILD_HOST: actions
+        run: |
+          set -o pipefail
+          mkdir -p out
+          make O=out "${{ inputs.defconfig }}"
+          make O=out -j"$(nproc)" 2>&1 | tee build.log
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          mkdir -p artifacts
+          cp out/.config artifacts/config 2>/dev/null || true
+          cp build.log artifacts/ 2>/dev/null || true
+          cp out/arch/*/boot/Image* artifacts/ 2>/dev/null || true
+          cp out/arch/*/boot/zImage* artifacts/ 2>/dev/null || true
+          find out/arch -name '*.dtb' -exec cp {} artifacts/ \; 2>/dev/null || true
+          ls -lh artifacts
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ github.run_number }}
+          path: artifacts/
